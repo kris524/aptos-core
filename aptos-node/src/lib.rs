@@ -13,7 +13,8 @@ use aptos_config::{
 use aptos_data_client::aptosnet::AptosNetDataClient;
 use aptos_infallible::RwLock;
 use aptos_logger::{prelude::*, Logger};
-use aptos_metrics::metric_server;
+use aptos_metrics::{get_public_json_metrics, get_public_metrics, metric_server};
+use aptos_telemetry::send_data;
 use aptos_time_service::TimeService;
 use aptos_types::{
     account_config::aptos_root_address,
@@ -40,6 +41,7 @@ use futures::channel::mpsc::channel;
 use mempool_notifications::MempoolNotificationSender;
 use network::application::storage::PeerMetadataStorage;
 use network_builder::builder::NetworkBuilder;
+use regex::Regex;
 use state_sync_multiplexer::{
     state_sync_v1_network_config, StateSyncMultiplexer, StateSyncRuntimes,
 };
@@ -79,6 +81,7 @@ pub struct AptosHandle {
     _mempool: Runtime,
     _network_runtimes: Vec<Runtime>,
     _state_sync_runtimes: StateSyncRuntimes,
+    _telemetry_runtime: Runtime,
 }
 
 pub fn start(config: &NodeConfig, log_file: Option<PathBuf>) {
@@ -385,6 +388,38 @@ fn setup_state_sync_storage_service(
     storage_service_runtime
 }
 
+async fn periodic_telemetry_dump() {
+    use futures::stream::StreamExt;
+    let mut dump_interval =
+        IntervalStream::new(tokio::time::interval(std::time::Duration::from_secs(30))).fuse();
+
+    info!("periodic_telemetry_dump task started");
+
+    loop {
+        futures::select! {
+            _ = dump_interval.select_next_some() => {
+
+                // Build the params from internal prometheus metrics
+                let mut metrics_params: HashMap<String, String> = HashMap::new();
+
+                // Measurement Protocol params must be underscore or alphanumeric
+                // Prometheus metrics use {} to represent dimensions, so rename it
+                let met = get_public_metrics();
+                let re = Regex::new(r"[\{\}]").unwrap();
+                for (k, v) in &met {
+                    metrics_params.insert(re.replace_all(k, "_").to_string(), v.to_string());
+                }
+                let met = get_public_json_metrics();
+                for (k, v) in &met {
+                    metrics_params.insert(k.to_string(), v.to_string());
+                }
+
+                send_data("APTOS_NODE_PUSH_METRICS".to_string(), metrics_params).await;
+            }
+        }
+    }
+}
+
 async fn periodic_state_dump(node_config: NodeConfig, db: DbReaderWriter) {
     use futures::stream::StreamExt;
 
@@ -670,6 +705,14 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
         .handle()
         .spawn(periodic_state_dump(node_config.to_owned(), db_rw));
 
+    let telemery_runtime = Builder::new_multi_thread()
+        .thread_name("aptos-telemetry")
+        .enable_all()
+        .build()
+        .expect("Failed to create aptos telemetry runtime!");
+
+    telemery_runtime.handle().spawn(periodic_telemetry_dump());
+
     AptosHandle {
         _api: api_runtime,
         _backup: backup_service,
@@ -678,5 +721,6 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
         _mempool: mempool,
         _network_runtimes: network_runtimes,
         _state_sync_runtimes: state_sync_runtimes,
+        _telemetry_runtime: telemery_runtime,
     }
 }
